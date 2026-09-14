@@ -192,7 +192,7 @@ def cmd_start(message):
     ALL_USERS.add(message.chat.id)
 
     if message.chat.id in BANNED_USERS:
-        bot.send_message(message.chat.id, "🚫 شما توسط مدیر بن شده‌اید.")
+        bot.send_message(message.chat.id, "🚫 ســـــیک کــن ــــ مادر جندگی؟")
         return
 
     if not BOT_ENABLED and message.chat.id != ADMIN_ID:
@@ -204,7 +204,8 @@ def cmd_start(message):
         "╭──────────────────────────╮\n"
         "     ⚡️ **PX Deploy** ⚡️\n"
         "╰──────────────────────────╯\n\n"
-        "سلام رفیق! 👋\n\n"
+        "سلام گل! 👋\n"
+        " (😁ربات توی همین چند دقیقه به یه مشکلی خورده بود) \n\n"
         "من ربات خودکارسازی **Cloudflare** هستم.\n"
         "با چند تا کلیک ساده برات:\n\n"
         "  🗄️  دیتابیس **D1** می‌سازم\n"
