@@ -3,16 +3,23 @@ import os
 import sys
 import json
 import uuid
+import sqlite3
+import time
 import requests
 import telebot
 from telebot import types
+from datetime import datetime
 
 # ================== تنظیمات ==================
 BOT_TOKEN = "8944694178:AAE3NZPRLpBjxRmfHLAxg0_gl9IxT-7nmkc"
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 ADMIN_ID = 7326030446
 
-# لینک ساخت توکن کلودفلر با دسترسی‌های از پیش تنظیم‌شده
+# مسیر دیتابیس دائمی (روی Railway باید Volume به /data وصل باشه)
+DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/data")
+DB_PATH = os.path.join(DATA_DIR, "bot_data.db")
+
+# لینک ساخت توکن کلودفلر
 TOKEN_URL = (
     "https://dash.cloudflare.com/profile/api-tokens"
     "?permissionGroupKeys=%5B%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D"
@@ -21,7 +28,6 @@ TOKEN_URL = (
     "&accountId=*&zoneId=all&name=PX%20Deploy"
 )
 
-# آدرس دریافت کد ورکر از گیت‌هاب (فایل هش‌شده)
 WORKER_CODE_URL = "https://raw.githubusercontent.com/iran-px-panel/px_wokers/refs/heads/main/worker.js"
 
 if sys.platform.startswith('win'):
@@ -31,13 +37,99 @@ if sys.platform.startswith('win'):
     except Exception:
         pass
 
+# ================== دیتابیس دائمی ==================
+def init_db():
+    """ساخت جداول دیتابیس در صورت عدم وجود"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TEXT,
+            is_banned INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            chat_id INTEGER PRIMARY KEY,
+            account_id TEXT,
+            account_name TEXT,
+            workers TEXT DEFAULT '[]',
+            db_uuids TEXT DEFAULT '[]',
+            updated_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def db_execute(query, params=(), fetch=False):
+    """اجرای کوئری دیتابیس با مدیریت اتصال"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(query, params)
+    if fetch:
+        result = c.fetchall()
+    else:
+        result = None
+    conn.commit()
+    conn.close()
+    return result
+
+def db_get_user(chat_id):
+    """گرفتن اطلاعات کاربر"""
+    row = db_execute("SELECT chat_id, username, first_name, is_banned FROM users WHERE chat_id=?", (chat_id,), fetch=True)
+    if row:
+        return {"chat_id": row[0][0], "username": row[0][1], "first_name": row[0][2], "is_banned": bool(row[0][3])}
+    return None
+
+def db_save_user(chat_id, username, first_name):
+    """ذخیره یا آپدیت کاربر"""
+    db_execute(
+        "INSERT OR REPLACE INTO users (chat_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+        (chat_id, username, first_name, datetime.now().isoformat())
+    )
+
+def db_get_all_users():
+    """گرفتن لیست همه کاربران (برای broadcast)"""
+    rows = db_execute("SELECT chat_id FROM users WHERE is_banned=0", fetch=True)
+    return [r[0] for r in rows] if rows else []
+
+def db_set_ban(chat_id, banned=True):
+    """بن یا رفع بن کاربر"""
+    db_execute("UPDATE users SET is_banned=? WHERE chat_id=?", (1 if banned else 0, chat_id))
+
+def db_save_session(chat_id, account_id, account_name, workers, db_uuids):
+    """ذخیره سشن کاربر در دیتابیس"""
+    db_execute(
+        "INSERT OR REPLACE INTO sessions (chat_id, account_id, account_name, workers, db_uuids, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, account_id, account_name, json.dumps(workers), json.dumps(db_uuids), datetime.now().isoformat())
+    )
+
+def db_get_state(key, default=None):
+    """گرفتن وضعیت ربات از دیتابیس"""
+    row = db_execute("SELECT value FROM bot_state WHERE key=?", (key,), fetch=True)
+    return row[0][0] if row else default
+
+def db_set_state(key, value):
+    """ذخیره وضعیت ربات در دیتابیس"""
+    db_execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, str(value)))
+
 # ================== وضعیت سراسری ==================
 USER_SESSIONS = {}
 ALL_USERS = set()
 BANNED_USERS = {}
-BOT_ENABLED = True
 ADMIN_REPLY_MAP = {}
 CANCEL_FLAGS = set()
+BOT_ENABLED = True
 
 # ================== توابع Cloudflare ==================
 def cf_session(token):
@@ -81,7 +173,6 @@ def create_d1_database(session, account_id, db_name):
     return data["result"]["uuid"]
 
 def fetch_worker_code():
-    """دریافت کد ورکر از گیت‌هاب به صورت خام و بدون تغییر"""
     r = requests.get(WORKER_CODE_URL, timeout=25)
     if r.status_code != 200:
         raise Exception(f"دریافت کد از گیت‌هاب ناموفق بود: کد {r.status_code}")
@@ -91,7 +182,6 @@ def fetch_worker_code():
     return text
 
 def upload_worker(session, account_id, worker_name, db_uuid, worker_code):
-    """آپلود ورکر با کد خام (بدون هیچ تغییر) و بایندینگ D1"""
     metadata = {
         "main_module": "worker.js",
         "bindings": [{"name": "DB", "type": "d1", "id": db_uuid}],
@@ -160,15 +250,7 @@ def cancel_markup():
 bot = telebot.TeleBot(BOT_TOKEN)
 
 def btn(text, callback_data=None, url=None, style=None):
-    """
-    ساخت دکمه Inline با پشتیبانی اختیاری از style.
-    اگر نسخه‌ی pyTelegramBotAPI از style پشتیبانی نکند،
-    بدون خطا و به صورت دکمه‌ی معمولی ساخته می‌شود.
-    style می‌تواند یکی از این مقادیر باشد:
-      "primary"  → آبی
-      "success"  → سبز
-      "danger"   → قرمز
-    """
+    """ساخت دکمه Inline با پشتیبانی اختیاری از style"""
     kwargs = {}
     if url:
         kwargs['url'] = url
@@ -196,6 +278,7 @@ def admin_menu():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(btn("👥 آمار کاربران", callback_data="admin_users", style="primary"))
     kb.add(btn("📋 لیست کاربران", callback_data="admin_list_users", style="primary"))
+    kb.add(btn("📢 پیام همگانی", callback_data="admin_broadcast", style="success"))
     kb.add(btn("🛑 تعمیرات (خاموش/روشن)", callback_data="admin_maintenance", style="danger"))
     kb.add(btn("🚫 بن کاربر", callback_data="admin_ban_user", style="danger"))
     kb.add(btn("✅ رفع بن", callback_data="admin_unban_user", style="success"))
@@ -205,25 +288,28 @@ def admin_menu():
 # ================== دستورات ==================
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
-    USER_SESSIONS.pop(message.chat.id, None)
-    clear_cancel(message.chat.id)
-    ALL_USERS.add(message.chat.id)
+    chat_id = message.chat.id
+    USER_SESSIONS.pop(chat_id, None)
+    clear_cancel(chat_id)
+    ALL_USERS.add(chat_id)
 
-    if message.chat.id in BANNED_USERS:
-        bot.send_message(message.chat.id, "🚫 ســـــیک کــن ــــ مادر جندگی؟")
+    user = message.from_user
+    db_save_user(chat_id, user.username or "", user.first_name or "")
+
+    if db_get_user(chat_id) and db_get_user(chat_id).get("is_banned"):
+        bot.send_message(chat_id, "🚫 شما بن هستید.")
         return
 
-    if not BOT_ENABLED and message.chat.id != ADMIN_ID:
-        bot.send_message(message.chat.id, "🔧 ربات در حال تعمیرات است. لطفاً بعداً تلاش کنید.")
+    if not BOT_ENABLED and chat_id != ADMIN_ID:
+        bot.send_message(chat_id, "🔧 ربات در حال تعمیرات است. لطفاً بعداً تلاش کنید.")
         return
 
     bot.send_message(
-        message.chat.id,
+        chat_id,
         "╭──────────────────────────╮\n"
         "     ⚡️ **PX Deploy** ⚡️\n"
         "╰──────────────────────────╯\n\n"
-        "سلام گل! 👋\n"
-        " (😁ربات توی همین چند دقیقه به یه مشکلی خورده بود) \n\n"
+        "سلام گل! 👋\n\n"
         "من ربات خودکارسازی **Cloudflare** هستم.\n"
         "با چند تا کلیک ساده برات:\n\n"
         "  🗄️  دیتابیس **D1** می‌سازم\n"
@@ -239,7 +325,7 @@ def cmd_start(message):
         "━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='Markdown',
         disable_web_page_preview=True,
-        reply_markup=main_menu(message.chat.id)
+        reply_markup=main_menu(chat_id)
     )
 
 @bot.message_handler(commands=['leave'])
@@ -253,18 +339,54 @@ def cmd_leave(message):
         reply_markup=main_menu(message.chat.id)
     )
 
+@bot.message_handler(commands=['data'])
+def cmd_data(message):
+    """بررسی وضعیت Volume و دیتابیس دائمی"""
+    if message.chat.id != ADMIN_ID:
+        return
+
+    mount_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "نامشخص")
+    volume_name = os.environ.get("RAILWAY_VOLUME_NAME", "نامشخص")
+    db_exists = os.path.exists(DB_PATH)
+    db_size = os.path.getsize(DB_PATH) if db_exists else 0
+
+    users_count = len(db_get_all_users())
+
+    text = (
+        "╭──────────────────────╮\n"
+        "   💾 **وضعیت ذخیره‌سازی**\n"
+        "╰──────────────────────╯\n\n"
+        f"📂 مسیر Volume: `{mount_path}`\n"
+        f"🏷️ نام Volume: `{volume_name}`\n\n"
+        f"🗄️ مسیر دیتابیس: `{DB_PATH}`\n"
+        f"✅ وجود دیتابیس: {'بله' if db_exists else 'خیر'}\n"
+        f"📏 حجم دیتابیس: `{db_size}` بایت\n\n"
+        f"👥 کاربران ذخیره‌شده: `{users_count}`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 **راهنمای Railway:**\n"
+        "اگه می‌خوای دیتابیس دائمی بمونه:\n"
+        "1️⃣  برو تو پروژه Railway\n"
+        "2️⃣  روی سرویس کلیک کن → Settings → Volumes\n"
+        "3️⃣  Add Volume بزن\n"
+        "4️⃣  Mount Path رو بذار: `/data`\n"
+        "5️⃣  Redeploy کن\n\n"
+        "بدون Volume، دیتابیس هر بار ری‌استارت پاک می‌شه."
+    )
+    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
 @bot.message_handler(commands=['admin'])
 def cmd_admin(message):
     if message.chat.id != ADMIN_ID:
         return
     status = "🟢 فعال" if BOT_ENABLED else "🔴 تعمیرات"
+    total = len(db_get_all_users())
     bot.send_message(
         message.chat.id,
         f"╭──────────────────────╮\n"
         f"   🛡️ **پنل مدیریت**\n"
         f"╰──────────────────────╯\n\n"
         f"⚙️ وضعیت: {status}\n"
-        f"👥 کاربران کل: `{len(ALL_USERS)}`\n"
+        f"👥 کاربران کل: `{total}`\n"
         f"✅ کاربران فعال: `{len(USER_SESSIONS)}`\n"
         f"🚫 بن‌شده: `{len(BANNED_USERS)}`",
         parse_mode='Markdown',
@@ -342,12 +464,13 @@ def cb_admin_panel(call):
         return
     bot.answer_callback_query(call.id)
     status = "🟢 فعال" if BOT_ENABLED else "🔴 تعمیرات"
+    total = len(db_get_all_users())
     bot.edit_message_text(
         f"╭──────────────────────╮\n"
         f"   🛡️ **پنل مدیریت**\n"
         f"╰──────────────────────╯\n\n"
         f"⚙️ وضعیت: {status}\n"
-        f"👥 کاربران کل: `{len(ALL_USERS)}`\n"
+        f"👥 کاربران کل: `{total}`\n"
         f"✅ کاربران فعال: `{len(USER_SESSIONS)}`\n"
         f"🚫 بن‌شده: `{len(BANNED_USERS)}`",
         call.message.chat.id, call.message.message_id,
@@ -360,9 +483,10 @@ def cb_admin_users(call):
     if call.message.chat.id != ADMIN_ID:
         return
     bot.answer_callback_query(call.id)
+    total = len(db_get_all_users())
     bot.edit_message_text(
         f"📊 **آمار کامل ربات**\n\n"
-        f"👥 کاربران کل: `{len(ALL_USERS)}`\n"
+        f"👥 کاربران کل: `{total}`\n"
         f"✅ کاربران فعال: `{len(USER_SESSIONS)}`\n"
         f"🚫 بن‌شده: `{len(BANNED_USERS)}`\n"
         f"⚙️ وضعیت: {'🟢 فعال' if BOT_ENABLED else '🔴 تعمیرات'}",
@@ -375,16 +499,35 @@ def cb_admin_list_users(call):
     if call.message.chat.id != ADMIN_ID:
         return
     bot.answer_callback_query(call.id)
-    if not USER_SESSIONS:
-        text = "📭 هیچ کاربر فعالی وجود ندارد."
+    users = db_get_all_users()
+    if not users:
+        text = "📭 هیچ کاربری وجود ندارد."
     else:
-        lines = ["📋 **کاربران فعال:**\n"]
-        for cid, sess in USER_SESSIONS.items():
-            uname = sess.get("username", "?")
-            lines.append(f"• `{cid}` | @{uname}\n  └ اکانت: {sess['account_name']}")
+        lines = ["📋 **کاربران:**\n"]
+        for cid in users[:50]:
+            u = db_get_user(cid)
+            uname = f"@{u['username']}" if u and u.get('username') else "ندارد"
+            lines.append(f"• `{cid}` | {uname}")
+        if len(users) > 50:
+            lines.append(f"\n... و {len(users) - 50} کاربر دیگر")
         text = "\n".join(lines)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
                           parse_mode='Markdown', reply_markup=admin_menu())
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
+def cb_admin_broadcast(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    bot.answer_callback_query(call.id)
+    clear_cancel(call.message.chat.id)
+    bot.send_message(
+        call.message.chat.id,
+        "📢 **پیام همگانی**\n\n"
+        "متن پیام رو بفرست. این پیام به **همه‌ی کاربرانی که ربات رو استارت کردن** ارسال می‌شه.\n\n"
+        "💡 برای لغو، /leave رو بزن.",
+        reply_markup=cancel_markup()
+    )
+    bot.register_next_step_handler_by_chat_id(call.message.chat.id, handle_broadcast)
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_maintenance")
 def cb_admin_maintenance(call):
@@ -392,6 +535,7 @@ def cb_admin_maintenance(call):
     if call.message.chat.id != ADMIN_ID:
         return
     BOT_ENABLED = not BOT_ENABLED
+    db_set_state("bot_enabled", BOT_ENABLED)
     status = "🟢 روشن" if BOT_ENABLED else "🔴 خاموش (تعمیرات)"
     bot.answer_callback_query(call.id, f"وضعیت: {status}")
     bot.edit_message_text(
@@ -461,6 +605,7 @@ def handle_ban_user(message):
 
     BANNED_USERS[target_id] = sess
     USER_SESSIONS.pop(target_id, None)
+    db_set_ban(target_id, True)
 
     try:
         bot.send_message(target_id, "🚫 شما توسط مدیر بن شدید و تمام منابع‌تان حذف گردید.")
@@ -492,7 +637,80 @@ def handle_unban_user(message):
         return
 
     BANNED_USERS.pop(target_id)
+    db_set_ban(target_id, False)
     bot.send_message(message.chat.id, f"✅ کاربر `{target_id}` رفع بن شد.", parse_mode='Markdown', reply_markup=admin_menu())
+
+# ================== پیام همگانی ==================
+def handle_broadcast(message):
+    """ارسال پیام همگانی به همه کاربران"""
+    if message.chat.id != ADMIN_ID:
+        return
+    if is_cancelled(message.chat.id):
+        clear_cancel(message.chat.id)
+        return
+
+    if not message.text:
+        bot.send_message(message.chat.id, "❌ فقط متن پشتیبانی می‌شه.", reply_markup=admin_menu())
+        return
+
+    users = db_get_all_users()
+    if not users:
+        bot.send_message(message.chat.id, "📭 هیچ کاربری برای ارسال وجود ندارد.", reply_markup=admin_menu())
+        return
+
+    status_msg = bot.send_message(
+        message.chat.id,
+        f"📤 در حال ارسال به `{len(users)}` کاربر...\n\n"
+        f"⏳ لطفاً صبر کن...",
+        parse_mode='Markdown'
+    )
+
+    success = 0
+    failed = 0
+    blocked = 0
+
+    for i, uid in enumerate(users):
+        try:
+            bot.send_message(uid, message.text)
+            success += 1
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 403:
+                blocked += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+        # جلوگیری از Rate Limit (حداکثر ~30 پیام در ثانیه)
+        if (i + 1) % 25 == 0:
+            time.sleep(1.5)
+
+        # آپدیت پیشرفت هر 50 کاربر
+        if (i + 1) % 50 == 0:
+            try:
+                bot.edit_message_text(
+                    f"📤 در حال ارسال...\n\n"
+                    f"✅ موفق: `{success}`\n"
+                    f"🚫 بلاک: `{blocked}`\n"
+                    f"❌ خطا: `{failed}`\n"
+                    f"📊 پیشرفت: `{i+1}/{len(users)}`",
+                    message.chat.id, status_msg.message_id,
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+
+    bot.edit_message_text(
+        f"╭──────────────────────╮\n"
+        f"   📢 **ارسال کامل شد**\n"
+        f"╰──────────────────────╯\n\n"
+        f"👥 کل کاربران: `{len(users)}`\n"
+        f"✅ موفق: `{success}`\n"
+        f"🚫 بلاک‌شده: `{blocked}`\n"
+        f"❌ خطا: `{failed}`",
+        message.chat.id, status_msg.message_id,
+        parse_mode='Markdown', reply_markup=admin_menu()
+    )
 
 # ================== پیام به سازنده ==================
 def handle_contact_message(message):
@@ -553,7 +771,7 @@ def handle_create(message):
     chat_id = message.chat.id
     clear_cancel(chat_id)
 
-    if chat_id in BANNED_USERS:
+    if db_get_user(chat_id) and db_get_user(chat_id).get("is_banned"):
         bot.send_message(chat_id, "🚫 شما بن هستید.")
         return
 
@@ -577,7 +795,6 @@ def handle_create(message):
 
     db_uuid = None
     try:
-        # مرحله ۱: دریافت کد ورکر از گیت‌هاب (بدون تغییر)
         if is_cancelled(chat_id):
             raise Exception("cancelled")
         bot.edit_message_text(
@@ -587,7 +804,6 @@ def handle_create(message):
         )
         worker_code = fetch_worker_code()
 
-        # مرحله ۲: ساخت D1
         if is_cancelled(chat_id):
             raise Exception("cancelled")
         db_name = generate_random_name("db")
@@ -599,7 +815,6 @@ def handle_create(message):
         db_uuid = create_d1_database(session, account_id, db_name)
         sess.setdefault("db_uuids", []).append(db_uuid)
 
-        # مرحله ۳: آپلود ورکر با کد خام
         if is_cancelled(chat_id):
             delete_d1_database(session, account_id, db_uuid)
             sess["db_uuids"].remove(db_uuid)
@@ -615,7 +830,12 @@ def handle_create(message):
         upload_worker(session, account_id, worker_name, db_uuid, worker_code)
         sess.setdefault("workers", []).append(worker_name)
 
-        # مرحله ۴: لینک نهایی
+        # ذخیره سشن در دیتابیس دائمی
+        db_save_session(
+            chat_id, account_id, sess['account_name'],
+            sess.get("workers", []), sess.get("db_uuids", [])
+        )
+
         subdomain = get_worker_subdomain(session, account_id)
         if subdomain:
             worker_url = f"https://{worker_name}.{subdomain}.workers.dev"
@@ -663,7 +883,6 @@ def handle_create(message):
                 chat_id, status.message_id,
                 parse_mode='Markdown', reply_markup=main_menu(chat_id)
             )
-            # پاک‌سازی دیتابیس نیمه‌کاره
             try:
                 if db_uuid:
                     delete_d1_database(session, account_id, db_uuid)
@@ -688,7 +907,7 @@ def handle_token_input(message):
         clear_cancel(chat_id)
         return
 
-    if chat_id in BANNED_USERS:
+    if db_get_user(chat_id) and db_get_user(chat_id).get("is_banned"):
         bot.send_message(chat_id, "🚫 شما بن هستید.")
         return
 
@@ -739,10 +958,19 @@ def handle_token_input(message):
 
 # ================== اجرا ==================
 if __name__ == "__main__":
+    # راه‌اندازی دیتابیس دائمی
+    init_db()
+
+    # بارگذاری وضعیت ربات از دیتابیس
+    BOT_ENABLED = db_get_state("bot_enabled", "True") == "True"
+
     print("╭──────────────────────────╮")
     print("      🤖 PX Deploy Bot")
     print("╰──────────────────────────╯")
     print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"⚙️  Status: {'Enabled' if BOT_ENABLED else 'Maintenance'}")
     print(f"📥 Worker source: {WORKER_CODE_URL}")
+    print(f"💾 Data dir: {DATA_DIR}")
+    print(f"🗄️  DB path: {DB_PATH}")
+    print(f"📦 DB exists: {os.path.exists(DB_PATH)}")
     bot.infinity_polling()
