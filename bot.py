@@ -12,6 +12,7 @@ BOT_TOKEN = "8944694178:AAE3NZPRLpBjxRmfHLAxg0_gl9IxT-7nmkc"
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 ADMIN_ID = 7326030446
 
+# لینک ساخت توکن کلودفلر با دسترسی‌های از پیش تنظیم‌شده
 TOKEN_URL = (
     "https://dash.cloudflare.com/profile/api-tokens"
     "?permissionGroupKeys=%5B%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D"
@@ -20,6 +21,7 @@ TOKEN_URL = (
     "&accountId=*&zoneId=all&name=PX%20Deploy"
 )
 
+# آدرس دریافت کد ورکر از گیت‌هاب (فایل هش‌شده)
 WORKER_CODE_URL = "https://raw.githubusercontent.com/iran-px-panel/px_wokers/refs/heads/main/worker.js"
 
 if sys.platform.startswith('win'):
@@ -35,7 +37,7 @@ ALL_USERS = set()
 BANNED_USERS = {}
 BOT_ENABLED = True
 ADMIN_REPLY_MAP = {}
-CANCEL_FLAGS = set()  # کاربرانی که درخواست لغو دادن
+CANCEL_FLAGS = set()
 
 # ================== توابع Cloudflare ==================
 def cf_session(token):
@@ -79,24 +81,17 @@ def create_d1_database(session, account_id, db_name):
     return data["result"]["uuid"]
 
 def fetch_worker_code():
-    try:
-        r = requests.get(WORKER_CODE_URL, timeout=20)
-        if r.status_code == 200 and r.text.strip():
-            return r.text
-    except Exception:
-        pass
-    return """export default {
-  async fetch(request, env, ctx) {
-    const response = new Response("سلام از Cloudflare Worker!", {
-      status: 200,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
-    return response;
-  },
-};
-"""
+    """دریافت کد ورکر از گیت‌هاب به صورت خام و بدون تغییر"""
+    r = requests.get(WORKER_CODE_URL, timeout=25)
+    if r.status_code != 200:
+        raise Exception(f"دریافت کد از گیت‌هاب ناموفق بود: کد {r.status_code}")
+    text = r.text
+    if not text.strip():
+        raise Exception("فایل ورکر خالی است")
+    return text
 
 def upload_worker(session, account_id, worker_name, db_uuid, worker_code):
+    """آپلود ورکر با کد خام (بدون هیچ تغییر) و بایندینگ D1"""
     metadata = {
         "main_module": "worker.js",
         "bindings": [{"name": "DB", "type": "d1", "id": db_uuid}],
@@ -109,7 +104,7 @@ def upload_worker(session, account_id, worker_name, db_uuid, worker_code):
         "metadata": (None, json.dumps(metadata), "application/json; charset=utf-8"),
         "worker.js": ("worker.js", worker_code.encode('utf-8'), "application/javascript+module")
     }
-    r = requests.put(url, headers=headers, files=files, timeout=60)
+    r = requests.put(url, headers=headers, files=files, timeout=90)
     data = r.json()
     if not data.get("success"):
         raise Exception(f"خطا در ساخت ورکر: {data.get('errors')}")
@@ -195,15 +190,15 @@ def cmd_start(message):
     USER_SESSIONS.pop(message.chat.id, None)
     clear_cancel(message.chat.id)
     ALL_USERS.add(message.chat.id)
-    
+
     if message.chat.id in BANNED_USERS:
         bot.send_message(message.chat.id, "🚫 شما توسط مدیر بن شده‌اید.")
         return
-    
+
     if not BOT_ENABLED and message.chat.id != ADMIN_ID:
         bot.send_message(message.chat.id, "🔧 ربات در حال تعمیرات است. لطفاً بعداً تلاش کنید.")
         return
-    
+
     bot.send_message(
         message.chat.id,
         "╭──────────────────────────╮\n"
@@ -417,42 +412,42 @@ def handle_ban_user(message):
     except ValueError:
         bot.send_message(message.chat.id, "❌ آیدی نامعتبر.", reply_markup=admin_menu())
         return
-    
+
     if target_id in BANNED_USERS:
         bot.send_message(message.chat.id, "⚠️ این کاربر قبلاً بن شده.", reply_markup=admin_menu())
         return
     if target_id not in USER_SESSIONS:
         bot.send_message(message.chat.id, "❌ این کاربر توکنی ثبت نکرده.", reply_markup=admin_menu())
         return
-    
+
     sess = USER_SESSIONS[target_id]
     session = sess["session"]
     account_id = sess["account_id"]
     workers = sess.get("workers", [])
     db_uuids = sess.get("db_uuids", [])
-    
+
     msg = bot.send_message(message.chat.id, f"⏳ در حال پاک کردن منابع کاربر `{target_id}`...", parse_mode='Markdown')
-    
+
     deleted_w = 0
     for w in workers:
         res = delete_worker(session, account_id, w)
         if res.get("success"):
             deleted_w += 1
-    
+
     deleted_db = 0
     for db in db_uuids:
         res = delete_d1_database(session, account_id, db)
         if res.get("success"):
             deleted_db += 1
-    
+
     BANNED_USERS[target_id] = sess
     USER_SESSIONS.pop(target_id, None)
-    
+
     try:
         bot.send_message(target_id, "🚫 شما توسط مدیر بن شدید و تمام منابع‌تان حذف گردید.")
     except Exception:
         pass
-    
+
     bot.edit_message_text(
         f"✅ کاربر `{target_id}` بن شد.\n\n"
         f"🗑️ ورکرهای حذف‌شده: `{deleted_w}`\n"
@@ -472,11 +467,11 @@ def handle_unban_user(message):
     except ValueError:
         bot.send_message(message.chat.id, "❌ آیدی نامعتبر.", reply_markup=admin_menu())
         return
-    
+
     if target_id not in BANNED_USERS:
         bot.send_message(message.chat.id, "❌ این کاربر بن نبوده.", reply_markup=admin_menu())
         return
-    
+
     BANNED_USERS.pop(target_id)
     bot.send_message(message.chat.id, f"✅ کاربر `{target_id}` رفع بن شد.", parse_mode='Markdown', reply_markup=admin_menu())
 
@@ -488,11 +483,11 @@ def handle_contact_message(message):
     if not message.text:
         bot.send_message(message.chat.id, "❌ فقط متن پشتیبانی می‌شه.")
         return
-    
+
     user = message.from_user
     username = f"@{user.username}" if user.username else "ندارد"
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "ناشناس"
-    
+
     try:
         sent = bot.send_message(
             ADMIN_ID,
@@ -538,11 +533,11 @@ def handle_admin_reply(message):
 def handle_create(message):
     chat_id = message.chat.id
     clear_cancel(chat_id)
-    
+
     if chat_id in BANNED_USERS:
         bot.send_message(chat_id, "🚫 شما بن هستید.")
         return
-    
+
     if chat_id not in USER_SESSIONS:
         bot.send_message(
             chat_id,
@@ -551,7 +546,7 @@ def handle_create(message):
             reply_markup=main_menu(chat_id)
         )
         return
-    
+
     status = bot.send_message(
         chat_id,
         "⏳ در حال ساخت منابع...\n🔧 این کار چند ثانیه طول می‌کشه.",
@@ -560,9 +555,9 @@ def handle_create(message):
     sess = USER_SESSIONS[chat_id]
     session = sess["session"]
     account_id = sess["account_id"]
-    
+
     try:
-        # مرحله ۱: دریافت کد ورکر
+        # مرحله ۱: دریافت کد ورکر از گیت‌هاب (بدون تغییر)
         if is_cancelled(chat_id):
             raise Exception("cancelled")
         bot.edit_message_text(
@@ -571,7 +566,7 @@ def handle_create(message):
             reply_markup=cancel_markup()
         )
         worker_code = fetch_worker_code()
-        
+
         # مرحله ۲: ساخت D1
         if is_cancelled(chat_id):
             raise Exception("cancelled")
@@ -583,14 +578,13 @@ def handle_create(message):
         )
         db_uuid = create_d1_database(session, account_id, db_name)
         sess.setdefault("db_uuids", []).append(db_uuid)
-        
-        # مرحله ۳: ساخت ورکر
+
+        # مرحله ۳: آپلود ورکر با کد خام
         if is_cancelled(chat_id):
-            # اگه کاربر لغو کرد، دیتابیس ساخته‌شده رو پاک کن
             delete_d1_database(session, account_id, db_uuid)
             sess["db_uuids"].remove(db_uuid)
             raise Exception("cancelled")
-        
+
         worker_name = generate_random_name("worker")
         bot.edit_message_text(
             f"📦 دیتابیس ساخته شد ✅\n\n"
@@ -600,14 +594,14 @@ def handle_create(message):
         )
         upload_worker(session, account_id, worker_name, db_uuid, worker_code)
         sess.setdefault("workers", []).append(worker_name)
-        
+
         # مرحله ۴: لینک نهایی
         subdomain = get_worker_subdomain(session, account_id)
         if subdomain:
             worker_url = f"https://{worker_name}.{subdomain}.workers.dev"
         else:
             worker_url = f"https://{worker_name}.<subdomain>.workers.dev"
-        
+
         final_text = (
             "╭──────────────────────╮\n"
             "    ✅ **عملیات موفق**\n"
@@ -630,18 +624,36 @@ def handle_create(message):
             reply_markup=main_menu(chat_id)
         )
         clear_cancel(chat_id)
-    
+
     except Exception as e:
-        if str(e) == "cancelled":
+        err_text = str(e)
+        if err_text == "cancelled":
             bot.edit_message_text(
                 "🛑 **عملیات توسط شما لغو شد.**\n\nمنابع نیمه‌کاره پاک شدن.",
                 chat_id, status.message_id,
                 parse_mode='Markdown', reply_markup=main_menu(chat_id)
             )
+        elif "Code generation from strings disallowed" in err_text:
+            bot.edit_message_text(
+                "❌ **خطای امنیتی Cloudflare**\n\n"
+                "کد ورکری که از گیت‌هاب گرفته شد، از `eval()` یا `new Function()` استفاده می‌کنه.\n"
+                "Cloudflare Workers به‌دلایل امنیتی این کار رو **ممنوع** کرده.\n\n"
+                "🔧 **راه‌حل:** باید فایل `worker.js` رو طوری تغییر بدی که از dynamic code generation استفاده نکنه.\n\n"
+                "❌ منابع نیمه‌کاره پاک شدن.",
+                chat_id, status.message_id,
+                parse_mode='Markdown', reply_markup=main_menu(chat_id)
+            )
+            # پاک‌سازی دیتابیس نیمه‌کاره
+            try:
+                if "db_uuid" in dir() and db_uuid:
+                    delete_d1_database(session, account_id, db_uuid)
+                    if db_uuid in sess.get("db_uuids", []):
+                        sess["db_uuids"].remove(db_uuid)
+            except Exception:
+                pass
         else:
             bot.edit_message_text(
-                f"❌ **خطا در ساخت:**\n\n`{e}`\n\n"
-                "اگه دوباره خطا گرفتی، توکن رو چک کن.",
+                f"❌ **خطا در ساخت:**\n\n`{err_text}`",
                 chat_id, status.message_id,
                 parse_mode='Markdown', reply_markup=main_menu(chat_id)
             )
@@ -651,38 +663,38 @@ def handle_create(message):
 @bot.message_handler(func=lambda m: True)
 def handle_token_input(message):
     chat_id = message.chat.id
-    
+
     if is_cancelled(chat_id):
         clear_cancel(chat_id)
         return
-    
+
     if chat_id in BANNED_USERS:
         bot.send_message(chat_id, "🚫 شما بن هستید.")
         return
-    
+
     if not BOT_ENABLED and chat_id != ADMIN_ID:
         bot.send_message(chat_id, "🔧 ربات در تعمیرات است.")
         return
-    
+
     token = (message.text or "").strip()
-    
+
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception:
         pass
-    
+
     if len(token) < 20:
         bot.send_message(chat_id, "❌ توکن نامعتبره. دوباره بفرست:")
         return
-    
+
     status = bot.send_message(chat_id, "🔐 در حال احراز هویت با Cloudflare...", reply_markup=cancel_markup())
-    
+
     try:
         user_info = verify_token_and_get_account(token)
         user_info["username"] = message.from_user.username or str(chat_id)
         USER_SESSIONS[chat_id] = user_info
         ALL_USERS.add(chat_id)
-        
+
         bot.edit_message_text(
             "╭──────────────────────╮\n"
             "   ✅ **احراز هویت موفق**\n"
@@ -695,7 +707,7 @@ def handle_token_input(message):
             parse_mode='Markdown',
             reply_markup=main_menu(chat_id)
         )
-    
+
     except Exception as e:
         bot.edit_message_text(
             f"❌ **احراز هویت ناموفق:**\n\n`{e}`\n\n"
