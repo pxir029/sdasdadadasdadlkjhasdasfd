@@ -153,35 +153,53 @@ def clear_cancel(chat_id):
 
 def cancel_markup():
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("❌ لغو عملیات", callback_data="cancel_op"))
+    kb.add(btn("❌ لغو عملیات", callback_data="cancel_op", style="danger"))
     return kb
 
 # ================== ربات ==================
 bot = telebot.TeleBot(BOT_TOKEN)
 
-def btn(text, callback_data=None, url=None):
+def btn(text, callback_data=None, url=None, style=None):
+    """
+    ساخت دکمه Inline با پشتیبانی اختیاری از style.
+    اگر نسخه‌ی pyTelegramBotAPI از style پشتیبانی نکند،
+    بدون خطا و به صورت دکمه‌ی معمولی ساخته می‌شود.
+    style می‌تواند یکی از این مقادیر باشد:
+      "primary"  → آبی
+      "success"  → سبز
+      "danger"   → قرمز
+    """
+    kwargs = {}
     if url:
-        return types.InlineKeyboardButton(text, url=url)
-    return types.InlineKeyboardButton(text, callback_data=callback_data)
+        kwargs['url'] = url
+    else:
+        kwargs['callback_data'] = callback_data
+    if style:
+        kwargs['style'] = style
+    try:
+        return types.InlineKeyboardButton(text, **kwargs)
+    except TypeError:
+        kwargs.pop('style', None)
+        return types.InlineKeyboardButton(text, **kwargs)
 
 def main_menu(chat_id=None):
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("🚀 ساخت ورکر جدید", callback_data="create"))
-    kb.add(btn("🔑 ساخت توکن کلودفلر", url=TOKEN_URL))
-    kb.add(btn("🔄 تغییر توکن", callback_data="change_token"))
-    kb.add(btn("💬 پیام به سازنده", callback_data="contact_admin"))
+    kb.add(btn("🚀 ساخت ورکر جدید", callback_data="create", style="primary"))
+    kb.add(btn("🔑 ساخت توکن کلودفلر", url=TOKEN_URL, style="success"))
+    kb.add(btn("🔄 تغییر توکن", callback_data="change_token", style="primary"))
+    kb.add(btn("💬 پیام به سازنده", callback_data="contact_admin", style="primary"))
     if chat_id == ADMIN_ID:
-        kb.add(btn("🛡️ پنل مدیریت", callback_data="admin_panel"))
+        kb.add(btn("🛡️ پنل مدیریت", callback_data="admin_panel", style="danger"))
     return kb
 
 def admin_menu():
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("👥 آمار کاربران", callback_data="admin_users"))
-    kb.add(btn("📋 لیست کاربران", callback_data="admin_list_users"))
-    kb.add(btn("🛑 تعمیرات (خاموش/روشن)", callback_data="admin_maintenance"))
-    kb.add(btn("🚫 بن کاربر", callback_data="admin_ban_user"))
-    kb.add(btn("✅ رفع بن", callback_data="admin_unban_user"))
-    kb.add(btn("🔙 بازگشت", callback_data="back_main"))
+    kb.add(btn("👥 آمار کاربران", callback_data="admin_users", style="primary"))
+    kb.add(btn("📋 لیست کاربران", callback_data="admin_list_users", style="primary"))
+    kb.add(btn("🛑 تعمیرات (خاموش/روشن)", callback_data="admin_maintenance", style="danger"))
+    kb.add(btn("🚫 بن کاربر", callback_data="admin_ban_user", style="danger"))
+    kb.add(btn("✅ رفع بن", callback_data="admin_unban_user", style="success"))
+    kb.add(btn("🔙 بازگشت", callback_data="back_main", style="primary"))
     return kb
 
 # ================== دستورات ==================
@@ -557,6 +575,7 @@ def handle_create(message):
     session = sess["session"]
     account_id = sess["account_id"]
 
+    db_uuid = None
     try:
         # مرحله ۱: دریافت کد ورکر از گیت‌هاب (بدون تغییر)
         if is_cancelled(chat_id):
@@ -646,7 +665,7 @@ def handle_create(message):
             )
             # پاک‌سازی دیتابیس نیمه‌کاره
             try:
-                if "db_uuid" in dir() and db_uuid:
+                if db_uuid:
                     delete_d1_database(session, account_id, db_uuid)
                     if db_uuid in sess.get("db_uuids", []):
                         sess["db_uuids"].remove(db_uuid)
