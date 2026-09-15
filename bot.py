@@ -40,6 +40,7 @@ def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
@@ -49,6 +50,7 @@ def init_db():
             is_banned INTEGER DEFAULT 0
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             chat_id INTEGER PRIMARY KEY,
@@ -60,12 +62,53 @@ def init_db():
             updated_at TEXT
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
+
+    # ---- migration: اضافه کردن ستون‌های گمشده اگر جدول قدیمی باشد ----
+    c.execute("PRAGMA table_info(sessions)")
+    columns = [row[1] for row in c.fetchall()]
+
+    if "token" not in columns:
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN token TEXT")
+            print("✅ migration: ستون token اضافه شد")
+        except Exception as e:
+            print(f"migration token: {e}")
+
+    if "workers" not in columns:
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN workers TEXT DEFAULT '[]'")
+            print("✅ migration: ستون workers اضافه شد")
+        except Exception as e:
+            print(f"migration workers: {e}")
+
+    if "db_uuids" not in columns:
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN db_uuids TEXT DEFAULT '[]'")
+            print("✅ migration: ستون db_uuids اضافه شد")
+        except Exception as e:
+            print(f"migration db_uuids: {e}")
+
+    if "updated_at" not in columns:
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
+            print("✅ migration: ستون updated_at اضافه شد")
+        except Exception as e:
+            print(f"migration updated_at: {e}")
+
+    if "account_name" not in columns:
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN account_name TEXT")
+            print("✅ migration: ستون account_name اضافه شد")
+        except Exception as e:
+            print(f"migration account_name: {e}")
+
     conn.commit()
     conn.close()
 
@@ -160,7 +203,7 @@ BANNED_USERS = {}
 ADMIN_REPLY_MAP = {}
 CANCEL_FLAGS = set()
 BOT_ENABLED = True
-WAITING_FOR = {}  # chat_id -> "token" | "contact" | "broadcast" | "ban" | "unban"
+WAITING_FOR = {}
 
 
 # ================== توابع Cloudflare ==================
@@ -223,9 +266,6 @@ def fetch_worker_code():
 
 
 def upload_worker(session, account_id, worker_name, db_uuid, worker_code):
-    """آپلود ورکر با compatibility_date جدید + فلگ allow_eval_during_startup
-    این دو مورد خطای Code generation from strings disallowed را برطرف می‌کنند.
-    """
     metadata = {
         "main_module": "worker.js",
         "bindings": [{"name": "DB", "type": "d1", "id": db_uuid}],
@@ -333,7 +373,6 @@ def admin_menu():
 
 
 def restore_session(chat_id):
-    """بازیابی سشن از دیتابیس در صورت نبودن در حافظه"""
     if chat_id in USER_SESSIONS:
         return USER_SESSIONS[chat_id]
     saved = db_get_session(chat_id)
@@ -357,7 +396,6 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     chat_id = message.chat.id
-    USER_SESSIONS.pop(chat_id, None)
     clear_cancel(chat_id)
     clear_waiting(chat_id)
 
@@ -373,12 +411,16 @@ def cmd_start(message):
         bot.send_message(chat_id, "🔧 ربات در حال تعمیرات است. لطفاً بعداً تلاش کنید.")
         return
 
+    # اگر سشن قبلی وجود دارد، بازیابی کن
+    restore_session(chat_id)
+
     bot.send_message(
         chat_id,
         "╭──────────────────────────╮\n"
         "     ⚡️ **PX Deploy** ⚡️\n"
         "╰──────────────────────────╯\n\n"
         "سلام گل! 👋\n\n"
+        "من ربات خودکارسازی **Cloudflare** هستم.\n"
         "با چند تا کلیک ساده برات:\n\n"
         "  🗄️  دیتابیس **D1** می‌سازم\n"
         "  ⚙️  **Worker** دیپلوی می‌کنم\n"
@@ -1189,5 +1231,5 @@ if __name__ == "__main__":
     print(f"💾 Data dir: {DATA_DIR}")
     print(f"🗄️  DB path: {DB_PATH}")
     print(f"📦 DB exists: {os.path.exists(DB_PATH)}")
-    print("✅ Fixed: compatibility_date + allow_eval_during_startup")
+    print("✅ Fixed: compatibility_date + allow_eval_during_startup + DB migration")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
